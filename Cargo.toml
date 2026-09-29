@@ -1,39 +1,26 @@
 [package]
-name = "mericartune"
-version = "0.1.0"
+name = "americartune"
+version = "0.3.0"
 edition = "2021"
-description = "Free & Open Source ECU Tuning Suite for American Cars - GM LS/LT, Ford, Dodge"
-authors = ["AmericarTune Contributors"]
+description = "Open-source ECU tuning suite for American cars — real binary tooling for GM LS/LT, Ford Coyote/Power Stroke, Dodge Hemi/Cummins"
+authors = ["AmericanTune Contributors"]
 license = "Apache-2.0"
-repository = "https://github.com/mericartune/mericartune"
+repository = "https://github.com/hashembasta8-dotcom/mericartune"
 readme = "README.md"
 keywords = ["ecu", "tuning", "automotive", "gm", "ford", "dodge"]
-categories = ["command-line-utilities", "hardware-support", "development-tools::build-utils"]
-
-[dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["json"], optional = true }
-anyhow = "1"
-tracing = "0.1"
-tracing-subscriber = "0.3"
-uuid = { version = "1", features = ["v4"] }
-chrono = "0.4"
-
-# ECU parsing
-hex = "0.4"
-memmap2 = "0.9"
-
-# CLI
-colored = "2"
-dialoguer = "0.11"
+categories = ["command-line-utilities", "hardware-support"]
 
 [features]
 default = []
-ai = []
-cloud = ["reqwest"]
+# Real serial-port I/O for ELM327 adapters (adds the `serialport` crate).
+hardware = ["dep:serialport"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+serialport = { version = "4", optional = true, default-features = false }
 
 [profile.release]
 opt-level = 3

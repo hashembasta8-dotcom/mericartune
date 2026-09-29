@@ -1,0 +1,19 @@
+{
+  "id": "gm_p01_512k",
+  "name": "GM P01 (512 KiB) — LS1/LS6 truck & F-body",
+  "family": "GM LS/LT",
+  "image_size": 524288,
+  "known_os_ids": ["12208322", "12208332", "12208342", "12202322"],
+  "os_id_hint": { "offset": 1280, "len": 8 },
+  "segments": [
+    {
+      "name": "calibration",
+      "start": 131072,
+      "end": 393216,
+      "algorithm": "zero-sum-32le",
+      "store_at": 393212,
+      "store_width": 4
+    }
+  ],
+  "status": "reference"
+}

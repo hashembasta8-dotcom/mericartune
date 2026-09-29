@@ -1,294 +1,173 @@
-//! AI-powered calibration assistant
-//!
-//! Uses machine learning to suggest optimal ECU tune parameters
-//! based on vehicle characteristics, modification level, and goals.
+//! Suggestion engine ("AI" command) — turns Aegis findings into concrete,
+//! reviewable cell edits. Deterministic and explainable: every suggestion
+//! cites the rule that produced it and the before/after values.
 
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use crate::analyze::AnalysisReport;
+use crate::ecu::tables::{EcuImageMut, EcuImageRef, Table2D};
 use anyhow::Result;
 
-/// AI calibration engine
-pub struct AiCalibrator {
-    /// Base models for different platforms
-    base_models: HashMap<String, BaseModel>,
-    /// Tuned parameters cache
-    parameter_cache: HashMap<String, TuneParameters>,
+#[derive(Debug, Clone)]
+pub struct Suggestion {
+    pub table: String,
+    pub cell: (usize, usize),
+    pub old_value: f64,
+    pub new_value: f64,
+    pub reason: String,
 }
 
-/// Base model for a specific ECU platform
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BaseModel {
-    platform: String,
-    ecu_type: String,
-    displacement: f32,
-    horsepower_range: (f32, f32),
-    torque_range: (f32, f32),
-    base_maps: BaseMaps,
-    learning_rate: f32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BaseMaps {
-    fuel_lt1: Vec<Vec<f32>>,
-    spark_lt1: Vec<Vec<f32>>,
-    boost_pressure: Vec<Vec<f32>>,
-    vvt_timing: Vec<f32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum TuneTarget {
-    MaximumPower,
-    DailyDriver,
-    Economy,
-    Racing,
-    Street,
-    Custom { description: String },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TuneParameters {
-    pub make: String,
-    pub model: String,
-    pub year: String,
-    pub displacement: f32,
-    pub mods: ModificationLevel,
-    pub target: TuneTarget,
-    pub fuel_lt1: Vec<Vec<f32>>,
-    pub spark_lt1: Vec<Vec<f32>>,
-    pub boost_pressure: Vec<Vec<f32>>,
-    pub vvt_timing: Vec<f32>,
-    pub scalars: HashMap<String, f32>,
-    pub safety: SafetyProfile,
-    pub estimated_hp: f32,
-    pub estimated_torque: f32,
-    pub estimated_gain: f32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ModificationLevel {
-    Stock,
-    Stage1,
-    Stage2,
-    Stage3,
-    Built,
-    Race,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SafetyProfile {
-    pub max_egt: f32,
-    pub max_cylinder_pressure: f32,
-    pub safe_afr_range: (f32, f32),
-    pub max_ignition_timing: f32,
-    pub max_boost: Option<f32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AiAnalysis {
-    pub base_file: String,
-    pub target_profile: TuneTarget,
-    pub recommended_changes: Vec<ChangeRecommendation>,
-    pub safety_warnings: Vec<String>,
-    pub estimated_gain: f32,
-    pub confidence_score: f32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChangeRecommendation {
-    pub parameter: String,
-    pub current_value: f32,
-    pub recommended_value: f32,
-    pub change_reason: String,
-    pub safety_impact: String,
-}
-
-impl AiCalibrator {
-    pub fn new() -> Self {
-        let mut base_models = HashMap::new();
-        
-        base_models.insert("gm_p01".to_string(), BaseModel {
-            platform: "GM P01".to_string(),
-            ecu_type: "LS1/LS6".to_string(),
-            displacement: 5.7,
-            horsepower_range: (350.0, 550.0),
-            torque_range: (380.0, 500.0),
-            base_maps: BaseMaps {
-                fuel_lt1: vec![vec![8.0; 11]; 6],
-                spark_lt1: vec![vec![20.0; 11]; 6],
-                boost_pressure: vec![],
-                vvt_timing: vec![],
-            },
-            learning_rate: 0.1,
-        });
-        
-        base_models.insert("gm_p59".to_string(), BaseModel {
-            platform: "GM P59".to_string(),
-            ecu_type: "LS2/LS3/LS7".to_string(),
-            displacement: 6.2,
-            horsepower_range: (400.0, 650.0),
-            torque_range: (420.0, 580.0),
-            base_maps: BaseMaps {
-                fuel_lt1: vec![vec![8.0; 12]; 6],
-                spark_lt1: vec![vec![22.0; 12]; 6],
-                boost_pressure: vec![],
-                vvt_timing: vec![],
-            },
-            learning_rate: 0.1,
-        });
-        
-        base_models.insert("ford_coyote".to_string(), BaseModel {
-            platform: "Ford Coyote".to_string(),
-            ecu_type: "5.0L Ti-VCT".to_string(),
-            displacement: 5.0,
-            horsepower_range: (400.0, 700.0),
-            torque_range: (400.0, 650.0),
-            base_maps: BaseMaps {
-                fuel_lt1: vec![vec![7.5; 8]; 4],
-                spark_lt1: vec![vec![25.0; 8]; 4],
-                boost_pressure: vec![],
-                vvt_timing: vec![],
-            },
-            learning_rate: 0.1,
-        });
-        
-        Self {
-            base_models,
-            parameter_cache: HashMap::new(),
+/// Map findings to concrete cell edits (currently: spikes → neighbor median,
+/// range violations → clamped value, high-load timing → capped value).
+pub fn suggestions_from(report: &AnalysisReport, tables: &[Table2D]) -> Vec<Suggestion> {
+    let mut out = Vec::new();
+    for f in &report.findings {
+        if let (Some((r, c)), Some(new_v)) = (f.cell, f.suggested) {
+            let table = match tables.iter().find(|t| t.name == f.table) {
+                Some(t) => t,
+                None => continue,
+            };
+            // Old value is looked up by the caller when applying; store placeholder here.
+            out.push(Suggestion {
+                table: table.name.clone(),
+                cell: (r, c),
+                old_value: f64::NAN,
+                new_value: new_v,
+                reason: f.rule.clone(),
+            });
         }
     }
-    
-    pub fn analyze(&self, ecu_type: &str, target: &TuneTarget, 
-                   mods: &ModificationLevel) -> Result<AiAnalysis> {
-        let model = self.base_models.get(ecu_type)
-            .ok_or_else(|| anyhow::anyhow!("Unsupported ECU type: {}", ecu_type))?;
-        
-        let mut recommendations = Vec::new();
-        let mut warnings = Vec::new();
-        
-        let power_multiplier = match mods {
-            ModificationLevel::Stock => 1.0,
-            ModificationLevel::Stage1 => 1.05,
-            ModificationLevel::Stage2 => 1.15,
-            ModificationLevel::Stage3 => 1.25,
-            ModificationLevel::Built => 1.4,
-            ModificationLevel::Race => 1.6,
-        };
-        
-        // Analyze fuel maps
-        for (i, row) in model.base_maps.fuel_lt1.iter().enumerate() {
-            for (j, &val) in row.iter().enumerate() {
-                let target_val = match target {
-                    TuneTarget::MaximumPower => val * 1.15 * power_multiplier,
-                    TuneTarget::DailyDriver => val * 1.02,
-                    TuneTarget::Economy => val * 0.9,
-                    TuneTarget::Racing => val * 1.2 * power_multiplier,
-                    TuneTarget::Street => val * 1.1 * power_multiplier,
-                    TuneTarget::Custom { .. } => *val,
-                };
-                
-                if (target_val - val).abs() > 0.5 {
-                    recommendations.push(ChangeRecommendation {
-                        parameter: format!("Fuel_LT1[{}][{}]", i, j),
-                        current_value: val,
-                        recommended_value: target_val,
-                        change_reason: format!("Optimized for target"),
-                        safety_impact: "Monitor EGT and AFR".to_string(),
-                    });
-                }
-            }
-        }
-        
-        // Analyze spark maps
-        for (i, row) in model.base_maps.spark_lt1.iter().enumerate() {
-            for (j, &val) in row.iter().enumerate() {
-                let mut target_val = match target {
-                    TuneTarget::MaximumPower => val + 2.0,
-                    TuneTarget::DailyDriver => val + 0.5,
-                    TuneTarget::Economy => val - 1.0,
-                    TuneTarget::Racing => val + 3.0,
-                    TuneTarget::Street => val + 1.5,
-                    TuneTarget::Custom { .. } => *val,
-                };
-                
-                if target_val > model.horsepower_range.1 / 100.0 * 0.8 {
-                    warnings.push(format!("Spark timing at [{}][{}] may cause knock", i, j));
-                    target_val -= 1.0;
-                }
-                
-                if (target_val - val).abs() > 1.0 {
-                    recommendations.push(ChangeRecommendation {
-                        parameter: format!("Spark_LT1[{}][{}]", i, j),
-                        current_value: val,
-                        recommended_value: target_val,
-                        change_reason: format!("Optimized for target"),
-                        safety_impact: "Check for knock with dyno".to_string(),
-                    });
-                }
-            }
-        }
-        
-        let est_gain = match (target, mods) {
-            (TuneTarget::MaximumPower, ModificationLevel::Stage1) => 25.0,
-            (TuneTarget::MaximumPower, ModificationLevel::Stage2) => 35.0,
-            (TuneTarget::MaximumPower, ModificationLevel::Stage3) => 45.0,
-            (TuneTarget::MaximumPower, ModificationLevel::Built) => 60.0,
-            _ => 20.0,
-        };
-        
-        let confidence = match mods {
-            ModificationLevel::Stock => 0.85,
-            ModificationLevel::Stage1 => 0.80,
-            ModificationLevel::Stage2 => 0.75,
-            ModificationLevel::Stage3 => 0.70,
-            ModificationLevel::Built => 0.65,
-            ModificationLevel::Race => 0.60,
-        };
-        
-        Ok(AiAnalysis {
-            base_file: format!("base_{}.bin", ecu_type),
-            target_profile: target.clone(),
-            recommended_changes: recommendations,
-            safety_warnings: warnings,
-            estimated_gain: est_gain,
-            confidence_score: confidence,
-        })
-    }
-    
-    pub fn validate(&self, params: &TuneParameters) -> Vec<String> {
-        let mut warnings = Vec::new();
-        
-        for row in &params.fuel_lt1 {
-            for &val in row {
-                if val < 7.0 {
-                    warnings.push("Fuel map too lean - risk of detonation".to_string());
-                }
-                if val > 18.0 {
-                    warnings.push("Fuel map too rich".to_string());
-                }
-            }
-        }
-        
-        for row in &params.spark_lt1 {
-            for &val in row {
-                if val > params.safety.max_ignition_timing {
-                    warnings.push(format!("Spark timing {} exceeds safe limit {}", val, params.safety.max_ignition_timing));
-                }
-            }
-        }
-        
-        warnings
-    }
+    out
 }
+
+/// Resolve old values and (optionally) apply the suggestions to the image.
+/// Returns applied suggestions with real before/after values.
+pub fn apply(
+    report: &AnalysisReport,
+    tables: &[Table2D],
+    img: &mut crate::ecu::bin::EcuImage,
+    dry_run: bool,
+) -> Result<Vec<Suggestion>> {
+    let mut applied = Vec::new();
+    for s in suggestions_from(report, tables) {
+        let table = tables
+            .iter()
+            .find(|t| t.name == s.table)
+            .expect("table exists");
+        let old = table.get(&EcuImageRef(img), s.cell.0, s.cell.1)?;
+        let mut done = Suggestion { old_value: old, ..s };
+        if (old - done.new_value).abs() > 1e-9 {
+            if !dry_run {
+                done.new_value = table.set(
+                    &mut EcuImageMut(img),
+                    done.cell.0,
+                    done.cell.1,
+                    done.new_value,
+                )?;
+            }
+            done.reason = done.reason.clone();
+            applied.push(done);
+        }
+    }
+    let _ = report;
+    Ok(applied)
+}
+
+/// Human-readable suggestion list.
+pub fn render(sugg: &[Suggestion]) -> String {
+    let mut s = String::new();
+    for (i, g) in sugg.iter().enumerate() {
+        s.push_str(&format!(
+            "  {}. {}[{},{}]: {:.3} -> {:.3}   ({})\n",
+            i + 1,
+            g.table,
+            g.cell.0,
+            g.cell.1,
+            g.old_value,
+            g.new_value,
+            g.reason
+        ));
+    }
+    s
+}
+
+/// Convenience: run analyze + suggestions in one call.
+pub fn propose(
+    tables: &[Table2D],
+    img: &crate::ecu::bin::EcuImage,
+) -> Result<(AnalysisReport, Vec<Suggestion>)> {
+    let report = crate::analyze::analyze(tables, &EcuImageRef(img))?;
+    let sugg = suggestions_from(&report, tables);
+    Ok((report, sugg))
+}
+
+/// Public re-export for CLI rendering.
+pub use crate::analyze::Severity;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+    use crate::ecu::bin::EcuImage;
+    use crate::ecu::tables::{EcuImageMut, Scaling, ValueWidth};
+
+    fn table() -> Table2D {
+        Table2D {
+            name: "VE Table".into(),
+            units: "g/cyl".into(),
+            address: 32,
+            rows: vec![20.0, 60.0, 100.0],
+            cols: vec![1000.0, 2000.0, 3000.0, 4000.0],
+            width: ValueWidth::U8,
+            scaling: Scaling { factor: 1.0, offset: 0.0 },
+            col_stride: 1,
+            row_stride: 4,
+        }
+    }
+
     #[test]
-    fn test_ai_analysis() {
-        let ai = AiCalibrator::new();
-        let analysis = ai.analyze("gm_p59", &TuneTarget::MaximumPower, &ModificationLevel::Stage2).unwrap();
-        assert!(analysis.estimated_gain > 0.0);
-        assert!(analysis.confidence_score > 0.0);
+    fn suggestions_fix_an_injected_spike() {
+        let mut img = EcuImage::new(vec![0u8; 128], "t").unwrap();
+        let t = table();
+        {
+            let mut m = EcuImageMut(&mut img);
+            for r in 0..3 {
+                for c in 0..4 {
+                    t.set(&mut m, r, c, 80.0).unwrap();
+                }
+            }
+            t.set(&mut m, 1, 1, 200.0).unwrap();
+        }
+        let report = crate::analyze::analyze(&[t.clone()], &EcuImageRef(&img)).unwrap();
+        assert!(!report.findings.is_empty());
+
+        let before = img.clone();
+        let applied = apply(&report, &[t.clone()], &mut img, false).unwrap();
+        assert!(!applied.is_empty());
+        assert_ne!(before, img);
+
+        // Re-analyze: the spike must be gone.
+        let report2 = crate::analyze::analyze(&[t], &EcuImageRef(&img)).unwrap();
+        assert!(
+            !report2.findings.iter().any(|f| f.rule == "outlier_spike"),
+            "spike should be fixed, still found: {:?}",
+            report2.findings
+        );
+    }
+
+    #[test]
+    fn dry_run_leaves_image_untouched() {
+        let mut img = EcuImage::new(vec![0u8; 128], "t").unwrap();
+        let t = table();
+        {
+            let mut m = EcuImageMut(&mut img);
+            for r in 0..3 {
+                for c in 0..4 {
+                    t.set(&mut m, r, c, 80.0).unwrap();
+                }
+            }
+            t.set(&mut m, 1, 1, 200.0).unwrap();
+        }
+        let before = img.clone();
+        let report = crate::analyze::analyze(&[t.clone()], &EcuImageRef(&img)).unwrap();
+        let _ = apply(&report, &[t], &mut img, true).unwrap();
+        assert_eq!(before, img);
     }
 }

@@ -1,0 +1,19 @@
+{
+  "id": "gm_p59_1m",
+  "name": "GM P59 (1 MiB) — LS2/4.8/5.3/6.0",
+  "family": "GM LS/LT",
+  "image_size": 1048576,
+  "known_os_ids": ["12587811", "12605114", "12606807", "12613246", "12629623"],
+  "os_id_hint": { "offset": 2048, "len": 8 },
+  "segments": [
+    {
+      "name": "calibration",
+      "start": 262144,
+      "end": 786432,
+      "algorithm": "zero-sum-32le",
+      "store_at": 786428,
+      "store_width": 4
+    }
+  ],
+  "status": "reference"
+}
